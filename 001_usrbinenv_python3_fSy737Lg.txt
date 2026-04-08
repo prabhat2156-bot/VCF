@@ -1,0 +1,1995 @@
+#!/usr/bin/env python3
+# =============================================================================
+# VCF Manager Bot — bot.py
+# Production-ready | python-telegram-bot v20+ (async) | Full Implementation
+# =============================================================================
+
+import os
+import io
+import re
+import csv
+import json
+import logging
+import asyncio
+import tempfile
+import shutil
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, List, Dict, Tuple, Any
+
+import pytz
+import phonenumbers
+from phonenumbers import geocoder, carrier
+
+import openpyxl
+from openpyxl import Workbook
+
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Document,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_VERSION = "2.0.0"
+IST = pytz.timezone("Asia/Kolkata")
+
+# File to persist user count
+USERS_FILE = "users.json"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# CONVERSATION STATES
+# =============================================================================
+
+# File Analysis
+FA_WAITING_FILES, FA_DONE = range(100, 102)
+
+# File Converter
+FC_WAITING_FILES, FC_CHOOSE_FORMAT, FC_DONE = range(200, 203)
+
+# Quick VCF
+QV_FILENAME, QV_CONTACT_NAME, QV_NUMBERS, QV_MORE, QV_NEW_CONTACT, QV_NEW_NUMBERS = range(300, 306)
+
+# VCF Maker
+VM_FILENAME, VM_CONTACT_NAME, VM_PER_FILE, VM_NUM_START, VM_FILE_START, VM_GROUP_NAME, VM_CONFIRM, VM_UPLOAD = range(400, 408)
+
+# Split VCF
+SV_WAITING_FILES, SV_OUTPUT_NAME, SV_CONTACT_NAME, SV_PER_FILE = range(500, 504)
+
+# Merge Files
+MF_WAITING_FILES, MF_DONE_UPLOAD, MF_OUTPUT_NAME, MF_FORMAT = range(600, 604)
+
+# File Editor
+FE_WAITING_FILES, FE_ACTION, FE_NUMBERS = range(700, 703)
+
+# List Maker
+LM_WAITING_SCREENSHOTS, LM_DONE = range(800, 802)
+
+# Rename File
+RF_WAITING_FILE, RF_ACTION, RF_NEW_NAME = range(900, 903)
+
+# =============================================================================
+# USER DATABASE HELPERS
+# =============================================================================
+
+def load_users() -> Dict[str, Any]:
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_users(data: Dict[str, Any]) -> None:
+    with open(USERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def register_user(user_id: int) -> int:
+    data = load_users()
+    data[str(user_id)] = True
+    save_users(data)
+    return len(data)
+
+
+def get_user_count() -> int:
+    return len(load_users())
+
+
+# =============================================================================
+# KEYBOARD BUILDERS
+# =============================================================================
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 File Analysis", callback_data="menu_analysis"),
+            InlineKeyboardButton("🔄 File Converter", callback_data="menu_converter"),
+        ],
+        [
+            InlineKeyboardButton("⚡ Quick VCF", callback_data="menu_quickvcf"),
+            InlineKeyboardButton("🛠️ VCF Maker", callback_data="menu_vcfmaker"),
+        ],
+        [
+            InlineKeyboardButton("✂️ Split VCF", callback_data="menu_split"),
+            InlineKeyboardButton("🔗 Merge Files", callback_data="menu_merge"),
+        ],
+        [
+            InlineKeyboardButton("✏️ File Editor", callback_data="menu_editor"),
+            InlineKeyboardButton("📋 List Maker", callback_data="menu_listmaker"),
+        ],
+        [
+            InlineKeyboardButton("📝 Rename File", callback_data="menu_rename"),
+        ],
+    ])
+
+
+def back_keyboard(callback: str = "back_main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 Back", callback_data=callback),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    ]])
+
+
+def back_only_keyboard(callback: str = "back_main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 Back to Main Menu", callback_data=callback),
+    ]])
+
+
+def format_keyboard(extra_callback: str = "") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📇 VCF", callback_data=f"fmt_vcf{extra_callback}"),
+            InlineKeyboardButton("📄 TXT", callback_data=f"fmt_txt{extra_callback}"),
+            InlineKeyboardButton("📊 Excel", callback_data=f"fmt_excel{extra_callback}"),
+            InlineKeyboardButton("🗂️ CSV", callback_data=f"fmt_csv{extra_callback}"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="back_main"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        ],
+    ])
+
+
+def yes_no_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes", callback_data="yn_yes"),
+            InlineKeyboardButton("❌ No", callback_data="yn_no"),
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+    ])
+
+
+def editor_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Add Numbers", callback_data="edit_add"),
+            InlineKeyboardButton("➖ Remove Numbers", callback_data="edit_remove"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="back_main"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        ],
+    ])
+
+
+def rename_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📄 Rename File", callback_data="rename_file"),
+            InlineKeyboardButton("👤 Rename Contacts", callback_data="rename_contacts"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="back_main"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        ],
+    ])
+
+
+def vm_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Confirm", callback_data="vm_confirm"),
+            InlineKeyboardButton("🔄 Restart", callback_data="vm_restart"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="back_main"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        ],
+    ])
+
+
+# =============================================================================
+# PHONE NUMBER UTILITIES
+# =============================================================================
+
+def extract_numbers_from_text(text: str) -> List[str]:
+    """Extract phone number strings from raw text."""
+    lines = re.split(r"[\n,;|\t]+", text)
+    numbers = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Remove non-digit characters except leading +
+        cleaned = re.sub(r"[^\d+]", "", line)
+        if cleaned and len(cleaned) >= 7:
+            numbers.append(cleaned)
+    return numbers
+
+
+def normalize_number(raw: str) -> Optional[str]:
+    """Try to parse and normalize a phone number, returning E.164 format."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    # Try with "+" prefix first, then as-is
+    for attempt in [raw if raw.startswith("+") else "+" + raw, raw]:
+        try:
+            parsed = phonenumbers.parse(attempt, None)
+            if phonenumbers.is_valid_number(parsed):
+                return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+        except Exception:
+            continue
+    # Fallback: just clean it
+    cleaned = re.sub(r"\D", "", raw)
+    if cleaned:
+        return ("+" if not raw.startswith("+") else "") + cleaned
+    return None
+
+
+def get_country_code(number_e164: str) -> str:
+    """Return 2-letter country code from E.164 number."""
+    try:
+        parsed = phonenumbers.parse(number_e164, None)
+        region = phonenumbers.region_code_for_number(parsed)
+        return region if region else "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+def analyze_numbers(raw_numbers: List[str]) -> Dict[str, Any]:
+    """Full analysis: valid/invalid, duplicates, country breakdown."""
+    valid = []
+    invalid = []
+    seen = set()
+    duplicates = []
+
+    for raw in raw_numbers:
+        norm = normalize_number(raw)
+        if norm:
+            if norm in seen:
+                duplicates.append(norm)
+            else:
+                seen.add(norm)
+                valid.append(norm)
+        else:
+            invalid.append(raw)
+
+    country_breakdown: Dict[str, int] = {}
+    for num in valid:
+        cc = get_country_code(num)
+        country_breakdown[cc] = country_breakdown.get(cc, 0) + 1
+
+    return {
+        "total_raw": len(raw_numbers),
+        "valid": valid,
+        "invalid": invalid,
+        "duplicates": duplicates,
+        "country_breakdown": country_breakdown,
+    }
+
+
+# =============================================================================
+# FILE PARSING UTILITIES
+# =============================================================================
+
+def parse_vcf(content: bytes) -> List[str]:
+    """Extract phone numbers from VCF file bytes."""
+    text = content.decode("utf-8", errors="replace")
+    numbers = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("TEL"):
+            parts = line.split(":")
+            if len(parts) >= 2:
+                num = parts[-1].strip()
+                numbers.append(num)
+    return numbers
+
+
+def parse_txt(content: bytes) -> List[str]:
+    text = content.decode("utf-8", errors="replace")
+    return extract_numbers_from_text(text)
+
+
+def parse_csv_bytes(content: bytes) -> List[str]:
+    text = content.decode("utf-8", errors="replace")
+    numbers = []
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        for cell in row:
+            cleaned = re.sub(r"[^\d+]", "", cell.strip())
+            if cleaned and len(cleaned) >= 7:
+                numbers.append(cleaned)
+    return numbers
+
+
+def parse_xlsx_bytes(content: bytes) -> List[str]:
+    numbers = []
+    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(values_only=True):
+            for cell in row:
+                if cell is not None:
+                    val = str(cell).strip()
+                    cleaned = re.sub(r"[^\d+]", "", val)
+                    if cleaned and len(cleaned) >= 7:
+                        numbers.append(cleaned)
+    return numbers
+
+
+def parse_file_bytes(content: bytes, filename: str) -> List[str]:
+    """Auto-detect file type and extract numbers."""
+    fn = filename.lower()
+    if fn.endswith(".vcf"):
+        return parse_vcf(content)
+    elif fn.endswith(".txt"):
+        return parse_txt(content)
+    elif fn.endswith(".csv"):
+        return parse_csv_bytes(content)
+    elif fn.endswith(".xlsx") or fn.endswith(".xls"):
+        return parse_xlsx_bytes(content)
+    else:
+        # Try as text
+        return parse_txt(content)
+
+
+# =============================================================================
+# FILE GENERATION UTILITIES
+# =============================================================================
+
+def generate_vcf_bytes(contacts: List[Tuple[str, List[str]]]) -> bytes:
+    """
+    contacts: list of (contact_name, [phone_numbers])
+    Returns VCF file bytes.
+    """
+    lines = []
+    for name, phones in contacts:
+        lines.append("BEGIN:VCARD")
+        lines.append("VERSION:3.0")
+        lines.append(f"FN:{name}")
+        lines.append(f"N:{name};;;; ")
+        for phone in phones:
+            lines.append(f"TEL;TYPE=CELL:{phone}")
+        lines.append("END:VCARD")
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def generate_txt_bytes(numbers: List[str]) -> bytes:
+    return "\n".join(numbers).encode("utf-8")
+
+
+def generate_csv_bytes(numbers: List[str]) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Phone Number"])
+    for num in numbers:
+        writer.writerow([num])
+    return output.getvalue().encode("utf-8")
+
+
+def generate_xlsx_bytes(numbers: List[str]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Numbers"
+    ws.append(["Phone Number"])
+    for num in numbers:
+        ws.append([num])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def generate_file_bytes(numbers: List[str], fmt: str, contact_name: str = "Contact") -> Tuple[bytes, str]:
+    """Generate file in specified format. Returns (bytes, extension)."""
+    if fmt == "vcf":
+        # One contact per number for simple conversion
+        contacts = [(f"{contact_name} {i+1}", [num]) for i, num in enumerate(numbers)]
+        return generate_vcf_bytes(contacts), "vcf"
+    elif fmt == "txt":
+        return generate_txt_bytes(numbers), "txt"
+    elif fmt == "excel":
+        return generate_xlsx_bytes(numbers), "xlsx"
+    elif fmt == "csv":
+        return generate_csv_bytes(numbers), "csv"
+    else:
+        return generate_txt_bytes(numbers), "txt"
+
+
+# =============================================================================
+# DISPLAY HELPERS
+# =============================================================================
+
+def get_ist_now() -> str:
+    return datetime.now(IST).strftime("%d %B %Y, %I:%M %p IST")
+
+
+def format_analysis_report(analysis: Dict[str, Any], source_label: str = "") -> str:
+    valid_count = len(analysis["valid"])
+    invalid_count = len(analysis["invalid"])
+    dup_count = len(analysis["duplicates"])
+    total = analysis["total_raw"]
+
+    country_lines = ""
+    for country, count in sorted(analysis["country_breakdown"].items(), key=lambda x: -x[1]):
+        flag = country_flag(country)
+        country_lines += f"  {flag} {country}: {count}\n"
+
+    dup_preview = ""
+    if analysis["duplicates"]:
+        preview = analysis["duplicates"][:5]
+        dup_preview = "\n  " + "\n  ".join(preview)
+        if len(analysis["duplicates"]) > 5:
+            dup_preview += f"\n  ... and {len(analysis['duplicates']) - 5} more"
+
+    label_part = f"📁 *{source_label}*\n" if source_label else ""
+
+    return (
+        f"{label_part}"
+        f"📊 *Analysis Report*\n"
+        f"{'─' * 30}\n"
+        f"📱 Total Numbers: `{total}`\n"
+        f"✅ Valid Numbers: `{valid_count}`\n"
+        f"❌ Invalid Numbers: `{invalid_count}`\n"
+        f"🔁 Duplicate Numbers: `{dup_count}`\n"
+        f"\n🌍 *Country Breakdown:*\n{country_lines or '  N/A'}"
+        f"{chr(10) + '🔁 *Duplicates:*' + dup_preview if dup_preview else ''}"
+    )
+
+
+def country_flag(code: str) -> str:
+    """Return emoji flag for ISO country code."""
+    if len(code) != 2 or not code.isalpha():
+        return "🌐"
+    return chr(ord(code[0].upper()) + 127397) + chr(ord(code[1].upper()) + 127397)
+
+
+def format_extension(fmt: str) -> str:
+    mapping = {"vcf": "vcf", "txt": "txt", "excel": "xlsx", "csv": "csv"}
+    return mapping.get(fmt, "txt")
+
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r"[^\w\- ]", "", name).strip() or "output"
+
+
+# =============================================================================
+# TEMP DIRECTORY HELPERS
+# =============================================================================
+
+def get_user_tmpdir(user_id: int) -> str:
+    path = os.path.join(tempfile.gettempdir(), f"vcfbot_{user_id}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def cleanup_user_tmpdir(user_id: int) -> None:
+    path = os.path.join(tempfile.gettempdir(), f"vcfbot_{user_id}")
+    if os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+# =============================================================================
+# /START COMMAND
+# =============================================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    total_users = register_user(user.id)
+    now_str = get_ist_now()
+
+    username_str = f"@{user.username}" if user.username else "N/A"
+    full_name = user.full_name or "N/A"
+
+    welcome_msg = (
+        f"╔══════════════════════════╗\n"
+        f"       📇 *VCF Manager Bot*\n"
+        f"╚══════════════════════════╝\n\n"
+        f"👋 Welcome, *{full_name}*!\n\n"
+        f"👤 *Your Info:*\n"
+        f"  • Name: `{full_name}`\n"
+        f"  • Username: `{username_str}`\n"
+        f"  • User ID: `{user.id}`\n\n"
+        f"🤖 *Bot Info:*\n"
+        f"  • Version: `v{BOT_VERSION}`\n"
+        f"  • Total Users: `{total_users}`\n"
+        f"  • Time: `{now_str}`\n\n"
+        f"📌 *Choose a feature below to get started:*"
+    )
+
+    await update.message.reply_text(
+        welcome_msg,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# =============================================================================
+# GLOBAL CANCEL & BACK HANDLER
+# =============================================================================
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if query:
+        await query.answer()
+        cleanup_user_tmpdir(update.effective_user.id)
+        context.user_data.clear()
+        await query.edit_message_text(
+            "❌ *Operation cancelled.*\n\nUse /start to return to the main menu.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        cleanup_user_tmpdir(update.effective_user.id)
+        context.user_data.clear()
+        await update.message.reply_text(
+            "❌ *Operation cancelled.*\n\nUse /start to return to the main menu.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    return ConversationHandler.END
+
+
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if query:
+        await query.answer()
+        context.user_data.clear()
+        cleanup_user_tmpdir(update.effective_user.id)
+        await query.edit_message_text(
+            "🏠 *Main Menu*\n\nChoose a feature:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(),
+        )
+    return ConversationHandler.END
+
+
+# =============================================================================
+# MAIN MENU CALLBACK DISPATCHER
+# =============================================================================
+
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    routing = {
+        "menu_analysis": start_analysis,
+        "menu_converter": start_converter,
+        "menu_quickvcf": start_quickvcf,
+        "menu_vcfmaker": start_vcfmaker,
+        "menu_split": start_split,
+        "menu_merge": start_merge,
+        "menu_editor": start_editor,
+        "menu_listmaker": start_listmaker,
+        "menu_rename": start_rename,
+    }
+    handler = routing.get(data)
+    if handler:
+        await handler(update, context)
+
+
+# =============================================================================
+# ── FEATURE 1: FILE ANALYSIS ──────────────────────────────────────────────────
+# =============================================================================
+
+async def start_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    context.user_data["fa_files"] = []
+    msg = (
+        "📊 *File Analysis*\n\n"
+        "Please upload your file(s).\n"
+        "📎 Supported: `VCF`, `TXT`, `CSV`, `XLSX`\n\n"
+        "You can send multiple files one by one.\n"
+        "When done, type `done`."
+    )
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return FA_WAITING_FILES
+
+
+async def fa_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if doc:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("fa_files", []).append((doc.file_name, content))
+        await update.message.reply_text(
+            f"✅ Received: `{doc.file_name}`\n\nSend more files or type `done` to analyze.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+        return FA_WAITING_FILES
+    return FA_WAITING_FILES
+
+
+async def fa_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    files = context.user_data.get("fa_files", [])
+    if not files:
+        await update.message.reply_text(
+            "⚠️ No files received. Please upload at least one file.",
+            reply_markup=back_keyboard(),
+        )
+        return FA_WAITING_FILES
+
+    await update.message.reply_text("🔍 Analyzing files, please wait...")
+
+    for fname, content in files:
+        raw_numbers = parse_file_bytes(content, fname)
+        analysis = analyze_numbers(raw_numbers)
+        report = format_analysis_report(analysis, source_label=fname)
+        await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+
+    context.user_data.pop("fa_files", None)
+    await update.message.reply_text(
+        "✅ *Analysis complete!*\n\nReturn to main menu:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_only_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 2: FILE CONVERTER ─────────────────────────────────────────────────
+# =============================================================================
+
+async def start_converter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["fc_files"] = []
+    msg = (
+        "🔄 *File Converter*\n\n"
+        "Please upload your file(s).\n"
+        "📎 Supported: `VCF`, `TXT`, `CSV`, `XLSX`\n\n"
+        "Send multiple files then type `done`."
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return FC_WAITING_FILES
+
+
+async def fc_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if doc:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("fc_files", []).append((doc.file_name, content))
+        await update.message.reply_text(
+            f"✅ Received: `{doc.file_name}`\n\nSend more files or type `done`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    return FC_WAITING_FILES
+
+
+async def fc_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    files = context.user_data.get("fc_files", [])
+    if not files:
+        await update.message.reply_text("⚠️ No files received. Upload at least one file.", reply_markup=back_keyboard())
+        return FC_WAITING_FILES
+
+    await update.message.reply_text(
+        "📤 *Choose output format:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=format_keyboard(),
+    )
+    return FC_CHOOSE_FORMAT
+
+
+async def fc_choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    fmt_map = {"fmt_vcf": "vcf", "fmt_txt": "txt", "fmt_excel": "excel", "fmt_csv": "csv"}
+    fmt = fmt_map.get(query.data)
+    if not fmt:
+        return FC_CHOOSE_FORMAT
+
+    files = context.user_data.get("fc_files", [])
+    await query.edit_message_text(f"⚙️ Converting {len(files)} file(s) to `{fmt.upper()}`...", parse_mode=ParseMode.MARKDOWN)
+
+    for fname, content in files:
+        raw_numbers = parse_file_bytes(content, fname)
+        analysis = analyze_numbers(raw_numbers)
+        valid_numbers = analysis["valid"]
+
+        base = Path(fname).stem
+        out_bytes, ext = generate_file_bytes(valid_numbers, fmt)
+        out_name = f"{base}_converted.{ext}"
+
+        bio = io.BytesIO(out_bytes)
+        bio.name = out_name
+        await query.message.reply_document(document=bio, filename=out_name, caption=f"✅ Converted: `{fname}` → `{out_name}`", parse_mode=ParseMode.MARKDOWN)
+
+    context.user_data.pop("fc_files", None)
+    await query.message.reply_text(
+        "✅ *Conversion complete!*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_only_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 3: QUICK VCF ──────────────────────────────────────────────────────
+# =============================================================================
+
+async def start_quickvcf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["qv_contacts"] = []
+    msg = (
+        "⚡ *Quick VCF Creator*\n\n"
+        "Step 1/4 — Enter the *file name* for your VCF:\n"
+        "_(e.g., `MyContacts`)_"
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return QV_FILENAME
+
+
+async def qv_get_filename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["qv_filename"] = sanitize_filename(update.message.text)
+    await update.message.reply_text(
+        f"✅ File name set: `{context.user_data['qv_filename']}`\n\n"
+        "Step 2/4 — Enter the *contact name*:\n_(e.g., `John`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return QV_CONTACT_NAME
+
+
+async def qv_get_contact_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["qv_current_contact"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Contact name: `{context.user_data['qv_current_contact']}`\n\n"
+        "Step 3/4 — Send the phone numbers.\n"
+        "You can *paste numbers directly* (one per line) or *upload a file*.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return QV_NUMBERS
+
+
+async def qv_get_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw_numbers: List[str] = []
+
+    if update.message.document:
+        doc = update.message.document
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        raw_numbers = parse_file_bytes(content, doc.file_name)
+    elif update.message.text:
+        raw_numbers = extract_numbers_from_text(update.message.text)
+
+    analysis = analyze_numbers(raw_numbers)
+    valid = analysis["valid"]
+    contact_name = context.user_data.get("qv_current_contact", "Contact")
+    context.user_data.setdefault("qv_contacts", []).append((contact_name, valid))
+
+    await update.message.reply_text(
+        f"✅ Added *{len(valid)}* numbers under *{contact_name}*.\n\n"
+        "Step 4/4 — Would you like to *add more contacts*?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=yes_no_keyboard(),
+    )
+    return QV_MORE
+
+
+async def qv_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "yn_yes":
+        await query.edit_message_text(
+            "➕ Enter the *next contact name*:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+        return QV_NEW_CONTACT
+    else:
+        return await qv_generate(query, context)
+
+
+async def qv_new_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["qv_current_contact"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Contact: `{context.user_data['qv_current_contact']}`\n\n"
+        "Send numbers (paste or upload file):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return QV_NEW_NUMBERS
+
+
+async def qv_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await qv_get_numbers(update, context)
+
+
+async def qv_generate(query_or_update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    contacts = context.user_data.get("qv_contacts", [])
+    filename = context.user_data.get("qv_filename", "QuickVCF")
+
+    if not contacts:
+        if hasattr(query_or_update, "edit_message_text"):
+            await query_or_update.edit_message_text("⚠️ No contacts to generate VCF.", reply_markup=back_keyboard())
+        return ConversationHandler.END
+
+    vcf_bytes = generate_vcf_bytes(contacts)
+    out_name = f"{filename}.vcf"
+    bio = io.BytesIO(vcf_bytes)
+    bio.name = out_name
+
+    total = sum(len(p) for _, p in contacts)
+    caption = (
+        f"✅ *Quick VCF Generated!*\n"
+        f"📁 File: `{out_name}`\n"
+        f"👥 Contacts: `{len(contacts)}`\n"
+        f"📱 Total Numbers: `{total}`"
+    )
+
+    msg = query_or_update.message if hasattr(query_or_update, "message") else query_or_update
+    await msg.reply_document(document=bio, filename=out_name, caption=caption, parse_mode=ParseMode.MARKDOWN)
+    await msg.reply_text("✅ Done!", reply_markup=back_only_keyboard())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 4: VCF MAKER ──────────────────────────────────────────────────────
+# =============================================================================
+
+async def start_vcfmaker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["vm"] = {}
+    msg = (
+        "🛠️ *VCF Maker*\n\n"
+        "Step 1/7 — Enter the *base file name*:\n_(e.g., `Contacts`)_"
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return VM_FILENAME
+
+
+async def vm_filename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["vm"]["filename"] = sanitize_filename(update.message.text)
+    await update.message.reply_text(
+        "Step 2/7 — Enter the *contact base name*:\n_(e.g., `Client`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return VM_CONTACT_NAME
+
+
+async def vm_contact_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["vm"]["contact_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Step 3/7 — How many *numbers per file*?\n_(e.g., `100`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return VM_PER_FILE
+
+
+async def vm_per_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        val = int(update.message.text.strip())
+        if val < 1:
+            raise ValueError
+        context.user_data["vm"]["per_file"] = val
+    except ValueError:
+        await update.message.reply_text("⚠️ Please enter a valid positive number.", reply_markup=back_keyboard())
+        return VM_PER_FILE
+
+    await update.message.reply_text(
+        "Step 4/7 — *Contact numbering start* (e.g., `1` to start from 'Contact 1'):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return VM_NUM_START
+
+
+async def vm_num_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        val = int(update.message.text.strip())
+        context.user_data["vm"]["num_start"] = val
+    except ValueError:
+        await update.message.reply_text("⚠️ Please enter a valid integer.", reply_markup=back_keyboard())
+        return VM_NUM_START
+
+    await update.message.reply_text(
+        "Step 5/7 — *VCF file numbering start* (e.g., `1` for 'FileName 1.vcf'):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return VM_FILE_START
+
+
+async def vm_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        val = int(update.message.text.strip())
+        context.user_data["vm"]["file_start"] = val
+    except ValueError:
+        await update.message.reply_text("⚠️ Please enter a valid integer.", reply_markup=back_keyboard())
+        return VM_FILE_START
+
+    await update.message.reply_text(
+        "Step 6/7 — Enter the *group name* (e.g., `Group 1`):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return VM_GROUP_NAME
+
+
+async def vm_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["vm"]["group_name"] = update.message.text.strip()
+    vm = context.user_data["vm"]
+
+    summary = (
+        "📋 *Settings Summary:*\n"
+        f"  • File Name: `{vm['filename']} N.vcf`\n"
+        f"  • Contact Name: `{vm['contact_name']} N`\n"
+        f"  • Numbers per File: `{vm['per_file']}`\n"
+        f"  • Contact Numbering Start: `{vm['num_start']}`\n"
+        f"  • File Numbering Start: `{vm['file_start']}`\n"
+        f"  • Group Name: `{vm['group_name']}`\n\n"
+        "Step 7/7 — Confirm settings to proceed:"
+    )
+    await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=vm_confirm_keyboard())
+    return VM_CONFIRM
+
+
+async def vm_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "vm_restart":
+        return await start_vcfmaker(update, context)
+    elif query.data == "vm_confirm":
+        await query.edit_message_text(
+            "✅ Settings confirmed!\n\n"
+            "Now upload your number file(s). Send multiple files and type `done` when finished.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+        context.user_data["vm_files"] = []
+        return VM_UPLOAD
+    return VM_CONFIRM
+
+
+async def vm_upload_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if doc:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("vm_files", []).append((doc.file_name, content))
+        await update.message.reply_text(
+            f"✅ Received: `{doc.file_name}`\n\nSend more or type `done`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    return VM_UPLOAD
+
+
+async def vm_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    files = context.user_data.get("vm_files", [])
+    if not files:
+        await update.message.reply_text("⚠️ No files uploaded. Please upload at least one file.", reply_markup=back_keyboard())
+        return VM_UPLOAD
+
+    vm = context.user_data.get("vm", {})
+    per_file = vm.get("per_file", 100)
+    contact_name = vm.get("contact_name", "Contact")
+    filename_base = vm.get("filename", "Output")
+    num_start = vm.get("num_start", 1)
+    file_start = vm.get("file_start", 1)
+    group_name_base = vm.get("group_name", "Group")
+
+    # Collect all numbers
+    all_numbers: List[str] = []
+    for fname, content in files:
+        raw = parse_file_bytes(content, fname)
+        analysis = analyze_numbers(raw)
+        all_numbers.extend(analysis["valid"])
+
+    if not all_numbers:
+        await update.message.reply_text("⚠️ No valid numbers found in uploaded files.", reply_markup=back_keyboard())
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"⚙️ Processing {len(all_numbers)} numbers into VCF files...")
+
+    # Split into chunks
+    chunks = [all_numbers[i:i+per_file] for i in range(0, len(all_numbers), per_file)]
+    contact_counter = num_start
+
+    for file_idx, chunk in enumerate(chunks):
+        file_number = file_start + file_idx
+        group_label = f"{group_name_base} {file_number}"
+        contacts = []
+        for phone in chunk:
+            full_name = f"{contact_name} {contact_counter} {group_label}"
+            contacts.append((full_name, [phone]))
+            contact_counter += 1
+
+        vcf_bytes = generate_vcf_bytes(contacts)
+        out_name = f"{filename_base} {file_number}.vcf"
+        bio = io.BytesIO(vcf_bytes)
+        bio.name = out_name
+        await update.message.reply_document(
+            document=bio,
+            filename=out_name,
+            caption=f"📁 `{out_name}` — {len(chunk)} contacts",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    await update.message.reply_text(
+        f"✅ *VCF Maker complete!*\n"
+        f"📁 Generated `{len(chunks)}` file(s).\n"
+        f"📱 Total contacts: `{len(all_numbers)}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_only_keyboard(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 5: SPLIT VCF ──────────────────────────────────────────────────────
+# =============================================================================
+
+async def start_split(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["sv_files"] = []
+    msg = (
+        "✂️ *Split VCF / File Splitter*\n\n"
+        "Upload your file(s).\n"
+        "📎 Supported: `VCF`, `TXT`, `CSV`, `XLSX`\n\n"
+        "Send multiple files then type `done`."
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return SV_WAITING_FILES
+
+
+async def sv_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if doc:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("sv_files", []).append((doc.file_name, content))
+        await update.message.reply_text(
+            f"✅ Received: `{doc.file_name}`\n\nSend more or type `done`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    return SV_WAITING_FILES
+
+
+async def sv_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    files = context.user_data.get("sv_files", [])
+    if not files:
+        await update.message.reply_text("⚠️ No files received.", reply_markup=back_keyboard())
+        return SV_WAITING_FILES
+
+    # Detect if any VCF to ask contact name
+    has_vcf = any(f[0].lower().endswith(".vcf") for f in files)
+    context.user_data["sv_has_vcf"] = has_vcf
+
+    await update.message.reply_text(
+        "Enter the *output file name base*:\n_(e.g., `Split`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return SV_OUTPUT_NAME
+
+
+async def sv_output_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["sv_output_name"] = sanitize_filename(update.message.text)
+
+    if context.user_data.get("sv_has_vcf"):
+        await update.message.reply_text(
+            "Enter the *contact name base* for VCF contacts:\n_(e.g., `Contact`)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+        return SV_CONTACT_NAME
+    else:
+        await update.message.reply_text(
+            "How many *numbers per split file*?\n_(e.g., `50`)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+        return SV_PER_FILE
+
+
+async def sv_contact_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["sv_contact_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "How many *numbers per split file*?\n_(e.g., `50`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return SV_PER_FILE
+
+
+async def sv_per_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        per_file = int(update.message.text.strip())
+        if per_file < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Enter a valid positive number.", reply_markup=back_keyboard())
+        return SV_PER_FILE
+
+    files = context.user_data.get("sv_files", [])
+    output_name = context.user_data.get("sv_output_name", "Split")
+    contact_name_base = context.user_data.get("sv_contact_name", "Contact")
+
+    await update.message.reply_text("⚙️ Splitting files...")
+
+    for orig_fname, content in files:
+        ext = Path(orig_fname).suffix.lower().lstrip(".")
+        raw = parse_file_bytes(content, orig_fname)
+        analysis = analyze_numbers(raw)
+        valid = analysis["valid"]
+
+        chunks = [valid[i:i+per_file] for i in range(0, len(valid), per_file)]
+
+        for idx, chunk in enumerate(chunks):
+            part_num = idx + 1
+            if ext == "vcf":
+                contacts = [(f"{contact_name_base} {i+1}", [num]) for i, num in enumerate(chunk)]
+                out_bytes = generate_vcf_bytes(contacts)
+                out_ext = "vcf"
+            elif ext == "csv":
+                out_bytes = generate_csv_bytes(chunk)
+                out_ext = "csv"
+            elif ext in ("xlsx", "xls"):
+                out_bytes = generate_xlsx_bytes(chunk)
+                out_ext = "xlsx"
+            else:
+                out_bytes = generate_txt_bytes(chunk)
+                out_ext = "txt"
+
+            out_name = f"{output_name} {part_num}.{out_ext}"
+            bio = io.BytesIO(out_bytes)
+            bio.name = out_name
+            await update.message.reply_document(
+                document=bio,
+                filename=out_name,
+                caption=f"✂️ Part {part_num}: `{len(chunk)}` numbers",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+    await update.message.reply_text(
+        "✅ *Split complete!*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_only_keyboard(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 6: MERGE FILES ────────────────────────────────────────────────────
+# =============================================================================
+
+async def start_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["mf_files"] = []
+    msg = (
+        "🔗 *File Merger*\n\n"
+        "Upload multiple files to merge.\n"
+        "📎 Supported: `VCF`, `TXT`, `CSV`, `XLSX`\n\n"
+        "Send all files, then type `done`."
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return MF_WAITING_FILES
+
+
+async def mf_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if doc:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("mf_files", []).append((doc.file_name, content))
+        count = len(context.user_data["mf_files"])
+        await update.message.reply_text(
+            f"✅ Received: `{doc.file_name}` ({count} file(s) so far)\n\nSend more or type `done`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    return MF_WAITING_FILES
+
+
+async def mf_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    files = context.user_data.get("mf_files", [])
+    if not files:
+        await update.message.reply_text("⚠️ No files received.", reply_markup=back_keyboard())
+        return MF_WAITING_FILES
+
+    await update.message.reply_text(
+        "Enter the *output file name*:\n_(e.g., `MergedContacts`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return MF_OUTPUT_NAME
+
+
+async def mf_output_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["mf_output_name"] = sanitize_filename(update.message.text)
+    await update.message.reply_text(
+        "📤 *Choose output format:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=format_keyboard(),
+    )
+    return MF_FORMAT
+
+
+async def mf_format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    fmt_map = {"fmt_vcf": "vcf", "fmt_txt": "txt", "fmt_excel": "excel", "fmt_csv": "csv"}
+    fmt = fmt_map.get(query.data)
+    if not fmt:
+        return MF_FORMAT
+
+    files = context.user_data.get("mf_files", [])
+    output_name = context.user_data.get("mf_output_name", "Merged")
+
+    await query.edit_message_text(f"⚙️ Merging {len(files)} file(s)...", parse_mode=ParseMode.MARKDOWN)
+
+    all_numbers: List[str] = []
+    for fname, content in files:
+        raw = parse_file_bytes(content, fname)
+        analysis = analyze_numbers(raw)
+        all_numbers.extend(analysis["valid"])
+
+    # De-duplicate
+    seen: set = set()
+    unique: List[str] = []
+    for n in all_numbers:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+
+    out_bytes, ext = generate_file_bytes(unique, fmt)
+    out_name = f"{output_name}.{ext}"
+    bio = io.BytesIO(out_bytes)
+    bio.name = out_name
+
+    await query.message.reply_document(
+        document=bio,
+        filename=out_name,
+        caption=(
+            f"✅ *Merge Complete!*\n"
+            f"📁 File: `{out_name}`\n"
+            f"📱 Total unique numbers: `{len(unique)}`"
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await query.message.reply_text("Done!", reply_markup=back_only_keyboard())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 7: FILE EDITOR ────────────────────────────────────────────────────
+# =============================================================================
+
+async def start_editor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["fe_files"] = []
+    msg = (
+        "✏️ *File Editor*\n\n"
+        "Upload file(s) to edit.\n"
+        "📎 Supported: `VCF`, `TXT`, `CSV`, `XLSX`\n\n"
+        "Send files then type `done`."
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return FE_WAITING_FILES
+
+
+async def fe_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if doc:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("fe_files", []).append((doc.file_name, content))
+        await update.message.reply_text(
+            f"✅ Received: `{doc.file_name}`\n\nSend more or type `done`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    return FE_WAITING_FILES
+
+
+async def fe_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    files = context.user_data.get("fe_files", [])
+    if not files:
+        await update.message.reply_text("⚠️ No files received.", reply_markup=back_keyboard())
+        return FE_WAITING_FILES
+
+    await update.message.reply_text(
+        f"📂 {len(files)} file(s) ready.\n\nChoose an action:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=editor_action_keyboard(),
+    )
+    return FE_ACTION
+
+
+async def fe_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["fe_action"] = query.data  # "edit_add" or "edit_remove"
+    action_word = "add to" if query.data == "edit_add" else "remove from"
+
+    await query.edit_message_text(
+        f"✏️ Send the numbers you want to *{action_word}* the files.\n\n"
+        "Paste numbers (one per line) or upload a file.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard(),
+    )
+    return FE_NUMBERS
+
+
+async def fe_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    new_raw: List[str] = []
+
+    if update.message.document:
+        doc = update.message.document
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray())
+        new_raw = parse_file_bytes(content, doc.file_name)
+    elif update.message.text:
+        new_raw = extract_numbers_from_text(update.message.text)
+
+    analysis = analyze_numbers(new_raw)
+    new_numbers = set(analysis["valid"])
+    action = context.user_data.get("fe_action", "edit_add")
+    files = context.user_data.get("fe_files", [])
+
+    await update.message.reply_text(f"⚙️ Processing {len(files)} file(s)...")
+
+    for fname, content in files:
+        ext = Path(fname).suffix.lower().lstrip(".")
+        raw = parse_file_bytes(content, fname)
+        analysis_orig = analyze_numbers(raw)
+        orig_valid = analysis_orig["valid"]
+
+        if action == "edit_add":
+            merged = list(dict.fromkeys(orig_valid + list(new_numbers)))  # preserve order, dedupe
+            result_numbers = merged
+        else:
+            result_numbers = [n for n in orig_valid if n not in new_numbers]
+
+        # Generate in same format
+        if ext == "vcf":
+            contacts = [(f"Contact {i+1}", [num]) for i, num in enumerate(result_numbers)]
+            out_bytes = generate_vcf_bytes(contacts)
+            out_ext = "vcf"
+        elif ext == "csv":
+            out_bytes = generate_csv_bytes(result_numbers)
+            out_ext = "csv"
+        elif ext in ("xlsx", "xls"):
+            out_bytes = generate_xlsx_bytes(result_numbers)
+            out_ext = "xlsx"
+        else:
+            out_bytes = generate_txt_bytes(result_numbers)
+            out_ext = "txt"
+
+        base = Path(fname).stem
+        out_name = f"{base}_edited.{out_ext}"
+        bio = io.BytesIO(out_bytes)
+        bio.name = out_name
+        action_label = "Added" if action == "edit_add" else "Removed"
+        await update.message.reply_document(
+            document=bio,
+            filename=out_name,
+            caption=(
+                f"✏️ *Edited:* `{fname}`\n"
+                f"📱 {action_label} `{len(new_numbers)}` number(s)\n"
+                f"📊 Total now: `{len(result_numbers)}`"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    await update.message.reply_text("✅ *Editing complete!*", parse_mode=ParseMode.MARKDOWN, reply_markup=back_only_keyboard())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# =============================================================================
+# ── FEATURE 8: LIST MAKER (OCR) ───────────────────────────────────────────────
+# =============================================================================
+
+async def start_listmaker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["lm_screenshots"] = []
+    msg = (
+        "📋 *List Maker (OCR)*\n\n"
+        "Send screenshots of group lists.\n"
+        "The bot will extract group names and pending requests.\n\n"
+        "Send all screenshots, then type `done`."
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+
+    if not OCR_AVAILABLE:
+        warn = "⚠️ *Note:* OCR libraries (pytesseract/Pillow) not installed. Install them for full functionality."
+        if query:
+            await query.message.reply_text(warn, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(warn, parse_mode=ParseMode.MARKDOWN)
+
+    return LM_WAITING_SCREENSHOTS
+
+
+async def lm_receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.photo:
+        photo = update.message.photo[-1]  # highest resolution
+        file = await photo.get_file()
+        content = bytes(await file.download_as_bytearray())
+        context.user_data.setdefault("lm_screenshots", []).append(content)
+        count = len(context.user_data["lm_screenshots"])
+        await update.message.reply_text(
+            f"✅ Screenshot {count} received.\n\nSend more or type `done`.",
+            reply_markup=back_keyboard(),
+        )
+    elif update.message.document:
+        doc = update.message.document
+        if doc.mime_type and doc.mime_type.startswith("image"):
+            file = await doc.get_file()
+            content = bytes(await file.download_as_bytearray())
+            context.user_data.setdefault("lm_screenshots", []).append(content)
+            count = len(context.user_data["lm_screenshots"])
+            await update.message.reply_text(
+                f"✅ Image {count} received.\n\nSend more or type `done`.",
+                reply_markup=back_keyboard(),
+            )
+    return LM_WAITING_SCREENSHOTS
+
+
+async def lm_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    screenshots = context.user_data.get("lm_screenshots", [])
+    if not screenshots:
+        await update.message.reply_text("⚠️ No screenshots received.", reply_markup=back_keyboard())
+        return LM_WAITING_SCREENSHOTS
+
+    await update.message.reply_text(f"🔍 Processing {len(screenshots)} screenshot(s) with OCR...")
+
+    all_entries: List[Tuple[str, int]] = []
+
+    for img_bytes in screenshots:
+        entries = extract_group_list_from_image(img_bytes)
+        all_entries.extend(entries)
+
+    if not all_entries:
+        await update.message.reply_text(
+            "⚠️ Could not extract any group list data from screenshots.\n\n"
+            "Make sure the screenshots contain clear group names and pending request counts.",
+            reply_markup=back_only_keyboard(),
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Sort by pending count descending
+    all_entries.sort(key=lambda x: -x[1])
+
+    lines = [f"📋 *Group List — {len(all_entries)} entries:*\n"]
+    for name, count in all_entries:
+        lines.append(f"• {name} — *{count}* pending requests")
+
+    result_text = "\n".join(lines)
+
+    # Send as message if short, else as document
+    if len(result_text) < 4000:
+        await update.message.reply_text(result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_only_keyboard())
+    else:
+        bio = io.BytesIO(result_text.encode("utf-8"))
+        bio.name = "group_list.txt"
+        await update.message.reply_document(document=bio, filename="group_list.txt", caption="📋 Group list extracted via OCR.")
+        await update.message.reply_text("✅ Done!", reply_markup=back_only_keyboard())
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def extract_group_list_from_image(img_bytes: bytes) -> List[Tuple[str, int]]:
+    """Use OCR to extract group name and pending counts from an image."""
+    if not OCR_AVAILABLE:
+        return []
+
+    try:
+        image = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(image)
+        return parse_group_list_text(text)
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
+        return []
+
+
+def parse_group_list_text(text: str) -> List[Tuple[str, int]]:
+    """Parse OCR text to find group names and pending request counts."""
+    entries = []
+    lines = text.splitlines()
+
+    # Patterns to detect "X pending" or "pending: X" or "X requests"
+    pending_patterns = [
+        re.compile(r"(.+?)\s*[-–:]\s*(\d+)\s*pending", re.IGNORECASE),
+        re.compile(r"(.+?)\s*[-–:]\s*pending\s*(\d+)", re.IGNORECASE),
+        re.compile(r"(.+?)\s*[-–:]\s*(\d+)\s*requests?", re.IGNORECASE),
+        re.compile(r"(\d+)\s+(.+?)\s+pending", re.IGNORECASE),
+    ]
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        for pattern in pending_patterns:
+            m = pattern.match(line)
+            if m:
+                groups = m.groups()
+                try:
+                    if groups[0].isdigit():
+                        count = int(groups[0])
+                        name = groups[1].strip()
+                    else:
+                        name = groups[0].strip()
+                        count = int(groups[1])
+                    if name and count > 0:
+                        entries.append((name, count))
+                        break
+                except (ValueError, IndexError):
+                    continue
+
+    # Fallback: look for lines with numbers that might be counts
+    if not entries:
+        for i, line in enumerate(lines):
+            nums = re.findall(r"\b(\d+)\b", line)
+            if nums and i > 0:
+                name_line = lines[i - 1].strip() if i > 0 else line
+                if name_line and not name_line.isdigit():
+                    try:
+                        entries.append((name_line, int(nums[0])))
+                    except ValueError:
+                        pass
+
+    return entries
+
+
+# =============================================================================
+# ── FEATURE 9: RENAME FILE ────────────────────────────────────────────────────
+# =============================================================================
+
+async def start_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["rf"] = {}
+    msg = (
+        "📝 *Rename File*\n\n"
+        "Upload the file you want to rename:"
+    )
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_keyboard())
+    return RF_WAITING_FILE
+
+
+async def rf_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("⚠️ Please upload a valid file.", reply_markup=back_keyboard())
+        return RF_WAITING_FILE
+
+    file = await doc.get_file()
+    content = bytes(await file.download_as_bytearray())
+    context.user_data["rf"]["filename"] = doc.file_name
+    context.user_data["rf"]["content"] = content
+
+    await update.message.reply_text(
+        f"✅ Received: `{doc.file_name}`\n\nChoose action:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rename_action_keyboard(),
+    )
+    return RF_ACTION
+
+
+async def rf_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data["rf"]["action"] = query.data
+
+    if query.data == "rename_file":
+        await query.edit_message_text(
+            "Enter the *new file name* (without extension):",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    else:
+        await query.edit_message_text(
+            "Enter the *new contact name base*:\n_(e.g., `Client` → 'Client 1', 'Client 2', ...)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    return RF_NEW_NAME
+
+
+async def rf_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    new_name = update.message.text.strip()
+    rf = context.user_data.get("rf", {})
+    orig_fname = rf.get("filename", "file")
+    content = rf.get("content", b"")
+    action = rf.get("action", "rename_file")
+    ext = Path(orig_fname).suffix.lower()
+
+    if action == "rename_file":
+        new_name_clean = sanitize_filename(new_name)
+        out_name = f"{new_name_clean}{ext}"
+        bio = io.BytesIO(content)
+        bio.name = out_name
+        await update.message.reply_document(
+            document=bio,
+            filename=out_name,
+            caption=f"📝 Renamed: `{orig_fname}` → `{out_name}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    else:  # rename_contacts
+        raw = parse_file_bytes(content, orig_fname)
+        analysis = analyze_numbers(raw)
+        valid = analysis["valid"]
+
+        ext_clean = ext.lstrip(".")
+        if ext_clean == "vcf":
+            contacts = [(f"{new_name} {i+1}", [num]) for i, num in enumerate(valid)]
+            out_bytes = generate_vcf_bytes(contacts)
+            out_ext = "vcf"
+        elif ext_clean == "csv":
+            out_bytes = generate_csv_bytes(valid)
+            out_ext = "csv"
+        elif ext_clean in ("xlsx", "xls"):
+            out_bytes = generate_xlsx_bytes(valid)
+            out_ext = "xlsx"
+        else:
+            out_bytes = generate_txt_bytes(valid)
+            out_ext = "txt"
+
+        out_name = f"{Path(orig_fname).stem}_renamed.{out_ext}"
+        bio = io.BytesIO(out_bytes)
+        bio.name = out_name
+        await update.message.reply_document(
+            document=bio,
+            filename=out_name,
+            caption=(
+                f"✏️ Contacts renamed to `{new_name} N`\n"
+                f"📱 Total: `{len(valid)}`"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    await update.message.reply_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN, reply_markup=back_only_keyboard())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# =============================================================================
+# UNKNOWN / FALLBACK HANDLERS
+# =============================================================================
+
+async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "❓ I didn't understand that. Use /start to see the main menu.",
+        reply_markup=back_only_keyboard(),
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ An unexpected error occurred. Please try again or use /start.",
+                reply_markup=back_only_keyboard(),
+            )
+    except Exception:
+        pass
+
+
+# =============================================================================
+# DONE TEXT FILTER
+# =============================================================================
+
+def is_done_text(update: Update) -> bool:
+    return bool(update.message and update.message.text and update.message.text.strip().lower() == "done")
+
+
+# =============================================================================
+# CONVERSATION HANDLERS SETUP
+# =============================================================================
+
+def build_application() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Global start
+    app.add_handler(CommandHandler("start", start))
+
+    # Main menu dispatcher (for menu buttons that don't start a ConversationHandler)
+    app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(cancel_handler, pattern="^cancel$"))
+
+    # ── File Analysis ────────────────────────────────────────────────────────
+    fa_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_analysis, pattern="^menu_analysis$")],
+        states={
+            FA_WAITING_FILES: [
+                MessageHandler(filters.Document.ALL, fa_receive_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), fa_done),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(fa_conv)
+
+    # ── File Converter ───────────────────────────────────────────────────────
+    fc_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_converter, pattern="^menu_converter$")],
+        states={
+            FC_WAITING_FILES: [
+                MessageHandler(filters.Document.ALL, fc_receive_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), fc_done),
+            ],
+            FC_CHOOSE_FORMAT: [
+                CallbackQueryHandler(fc_choose_format, pattern="^fmt_(vcf|txt|excel|csv)$"),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(fc_conv)
+
+    # ── Quick VCF ────────────────────────────────────────────────────────────
+    qv_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_quickvcf, pattern="^menu_quickvcf$")],
+        states={
+            QV_FILENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, qv_get_filename)],
+            QV_CONTACT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, qv_get_contact_name)],
+            QV_NUMBERS: [
+                MessageHandler(filters.Document.ALL, qv_get_numbers),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qv_get_numbers),
+            ],
+            QV_MORE: [CallbackQueryHandler(qv_more_callback, pattern="^yn_(yes|no)$")],
+            QV_NEW_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, qv_new_contact)],
+            QV_NEW_NUMBERS: [
+                MessageHandler(filters.Document.ALL, qv_new_numbers),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qv_new_numbers),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(qv_conv)
+
+    # ── VCF Maker ────────────────────────────────────────────────────────────
+    vm_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_vcfmaker, pattern="^menu_vcfmaker$")],
+        states={
+            VM_FILENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, vm_filename)],
+            VM_CONTACT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, vm_contact_name)],
+            VM_PER_FILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, vm_per_file)],
+            VM_NUM_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, vm_num_start)],
+            VM_FILE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, vm_file_start)],
+            VM_GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, vm_group_name)],
+            VM_CONFIRM: [CallbackQueryHandler(vm_confirm_callback, pattern="^vm_(confirm|restart)$")],
+            VM_UPLOAD: [
+                MessageHandler(filters.Document.ALL, vm_upload_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), vm_process),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(vm_conv)
+
+    # ── Split VCF ────────────────────────────────────────────────────────────
+    sv_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_split, pattern="^menu_split$")],
+        states={
+            SV_WAITING_FILES: [
+                MessageHandler(filters.Document.ALL, sv_receive_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), sv_done),
+            ],
+            SV_OUTPUT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_output_name)],
+            SV_CONTACT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_contact_name)],
+            SV_PER_FILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_per_file)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(sv_conv)
+
+    # ── Merge Files ──────────────────────────────────────────────────────────
+    mf_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_merge, pattern="^menu_merge$")],
+        states={
+            MF_WAITING_FILES: [
+                MessageHandler(filters.Document.ALL, mf_receive_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), mf_done),
+            ],
+            MF_OUTPUT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, mf_output_name)],
+            MF_FORMAT: [CallbackQueryHandler(mf_format_callback, pattern="^fmt_(vcf|txt|excel|csv)$")],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(mf_conv)
+
+    # ── File Editor ──────────────────────────────────────────────────────────
+    fe_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_editor, pattern="^menu_editor$")],
+        states={
+            FE_WAITING_FILES: [
+                MessageHandler(filters.Document.ALL, fe_receive_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), fe_done),
+            ],
+            FE_ACTION: [CallbackQueryHandler(fe_action_callback, pattern="^edit_(add|remove)$")],
+            FE_NUMBERS: [
+                MessageHandler(filters.Document.ALL, fe_numbers),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fe_numbers),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(fe_conv)
+
+    # ── List Maker ───────────────────────────────────────────────────────────
+    lm_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_listmaker, pattern="^menu_listmaker$")],
+        states={
+            LM_WAITING_SCREENSHOTS: [
+                MessageHandler(filters.PHOTO, lm_receive_screenshot),
+                MessageHandler(filters.Document.IMAGE, lm_receive_screenshot),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^done$"), lm_done),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(lm_conv)
+
+    # ── Rename File ──────────────────────────────────────────────────────────
+    rf_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_rename, pattern="^menu_rename$")],
+        states={
+            RF_WAITING_FILE: [MessageHandler(filters.Document.ALL, rf_receive_file)],
+            RF_ACTION: [CallbackQueryHandler(rf_action_callback, pattern="^rename_(file|contacts)$")],
+            RF_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rf_new_name)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(back_to_main, pattern="^back_main$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(rf_conv)
+
+    # Unknown message fallback
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, unknown_message))
+
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    return app
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main() -> None:
+    print("=" * 60)
+    print(f"  VCF Manager Bot v{BOT_VERSION}")
+    print(f"  Starting at {get_ist_now()}")
+    print("=" * 60)
+
+    app = build_application()
+    print("✅ Bot is running. Press Ctrl+C to stop.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
