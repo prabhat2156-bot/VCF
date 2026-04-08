@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-# =============================================================================
-# VCF Manager Bot — bot.py
-# Production-ready | python-telegram-bot v20+ (async) | Full Implementation
-# =============================================================================
-
-import os
 import io
 import re
 import csv
@@ -52,7 +45,7 @@ from telegram.constants import ParseMode
 # CONFIGURATION
 # =============================================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = "7727685861:AAHpBDIMT6pIrHawGznz80dgSUmuEReqL8w"
 BOT_VERSION = "2.0.0"
 IST = pytz.timezone("Asia/Kolkata")
 
