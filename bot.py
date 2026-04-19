@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 BRIDGE_URL  = os.getenv("BRIDGE_URL", "http://localhost:3000")
-BRIDGE_KEY  = os.getenv("BRIDGE_API_KEY", "")
+BRIDGE_KEY = os.getenv("BRIDGE_SECRET", "")
 MONGO_URI   = os.getenv("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/whatsapp_bot")
 RENDER_URL  = os.getenv("RENDER_URL", "")
 PORT        = int(os.getenv("PORT", 8080))
