@@ -1,0 +1,496 @@
+# WhatsApp Group Manager Bot — Complete Setup Guide
+### Render Deployment + Premium System Edition
+
+---
+
+## 📁 Project Structure
+
+```
+whatsapp-bot/
+├── bot.py                  ← Python Telegram Bot (main, Flask webhook server)
+├── bridge.js               ← Node.js Baileys Bridge Server
+├── premium.py              ← Premium user management module
+├── .env                    ← Environment variables (create this)
+├── requirements.txt        ← Python dependencies
+├── package.json            ← Node.js dependencies
+├── sessions/               ← Python temp session data (auto-created)
+├── wa_sessions/            ← WhatsApp Baileys sessions (auto-created)
+└── premium_users.db        ← SQLite database for premium users (auto-created)
+```
+
+---
+
+## ✅ Prerequisites
+
+Before you begin, make sure you have the following:
+
+| Requirement | Version | Notes |
+|---|---|---|
+| Python | 3.10+ | Required for bot.py |
+| Node.js | 18+ | Required for bridge.js |
+| npm | 9+ | Bundled with Node.js |
+| Telegram Bot Token | — | Get from [@BotFather](https://t.me/BotFather) |
+| Render Account | Free tier OK | [render.com](https://render.com) |
+| GitHub Repository | — | Render deploys from Git |
+
+> **Important:** Push your project to a GitHub (or GitLab) repository before deploying to Render. Render pulls code directly from your repo.
+
+---
+
+## 📦 Python Dependencies
+
+**`requirements.txt`**
+
+```
+python-telegram-bot==20.7
+requests==2.31.0
+python-dotenv==1.0.0
+Flask==3.0.2
+pytz==2024.1
+```
+
+Install locally:
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 📦 Node.js Dependencies
+
+**`package.json`**
+
+```json
+{
+  "name": "whatsapp-bridge",
+  "version": "1.0.0",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "express": "^4.18.2",
+    "dotenv": "^16.3.1",
+    "qrcode": "^1.5.3",
+    "pino": "^8.17.2"
+  }
+}
+```
+
+Install locally:
+```bash
+npm install
+```
+
+---
+
+## 🔐 Environment Variables (.env Template)
+
+Create a `.env` file in the project root. **Never commit this file to Git** — add it to `.gitignore`.
+
+```env
+# ─── Telegram Bot ───────────────────────────────────────
+BOT_TOKEN=your_telegram_bot_token_here
+
+# ─── WhatsApp Bridge ────────────────────────────────────
+BRIDGE_URL=https://your-bridge-service.onrender.com
+BRIDGE_SECRET=your_strong_random_secret_here
+
+# ─── Admin Configuration ────────────────────────────────
+# Comma-separated Telegram user IDs with admin privileges
+ADMIN_IDS=123456789,987654321
+
+# ─── Render Deployment ──────────────────────────────────
+# Full URL of your bot.py Render service (used for self-ping & webhook)
+RENDER_URL=https://my-wa-bot.onrender.com
+PORT=8443
+
+# ─── Premium System ─────────────────────────────────────
+# Set to "free" (all users allowed) or "paid" (premium only)
+BOT_MODE=paid
+```
+
+### Variable Reference
+
+| Variable | Description | Example |
+|---|---|---|
+| `BOT_TOKEN` | Telegram bot token from BotFather | `110201543:AAHdqTcvCH1vGWJxfSeofSh0K4Tgh1eUc0g` |
+| `BRIDGE_URL` | Render URL of your bridge.js service | `https://my-wa-bridge.onrender.com` |
+| `BRIDGE_SECRET` | Shared secret to authenticate bridge requests | `s3cr3tK3y!9z` |
+| `ADMIN_IDS` | Telegram IDs of bot admins (comma-separated) | `123456789,987654321` |
+| `RENDER_URL` | Render URL of your bot.py service (for webhook) | `https://my-wa-bot.onrender.com` |
+| `PORT` | Port Flask listens on (Render assigns this) | `8443` or `10000` |
+| `BOT_MODE` | `free` = open access, `paid` = premium required | `paid` |
+
+> **Tip:** Generate a strong `BRIDGE_SECRET` with: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+---
+
+## 🚀 Render Deployment Guide
+
+You will deploy **two separate Web Services** on Render:
+1. **Bot Service** — runs `bot.py` (Python, Flask + Telegram webhook)
+2. **Bridge Service** — runs `bridge.js` (Node.js, WhatsApp Baileys)
+
+---
+
+### Step 1 — Push to GitHub
+
+```bash
+git init
+git add .
+git commit -m "initial commit"
+git remote add origin https://github.com/YOUR_USERNAME/whatsapp-bot.git
+git push -u origin main
+```
+
+Make sure `.env` and `wa_sessions/` are in your `.gitignore`:
+```
+.env
+wa_sessions/
+sessions/
+premium_users.db
+__pycache__/
+node_modules/
+```
+
+---
+
+### Step 2 — Create the Bridge Service (bridge.js)
+
+1. Go to [dashboard.render.com](https://dashboard.render.com) → **New → Web Service**
+2. Connect your GitHub repository
+3. Configure the service:
+
+| Field | Value |
+|---|---|
+| **Name** | `my-wa-bridge` (or any name) |
+| **Runtime** | `Node` |
+| **Build Command** | `npm install` |
+| **Start Command** | `node bridge.js` |
+| **Instance Type** | Free (or Starter for persistence) |
+
+4. Under **Environment → Add Environment Variable**, set:
+
+| Key | Value |
+|---|---|
+| `BRIDGE_SECRET` | your secret key |
+
+5. Click **Create Web Service**
+6. Copy the service URL (e.g., `https://my-wa-bridge.onrender.com`) — you'll need it for the bot service
+
+---
+
+### Step 3 — Create the Bot Service (bot.py)
+
+1. Go to **New → Web Service** again
+2. Connect the **same GitHub repository**
+3. Configure the service:
+
+| Field | Value |
+|---|---|
+| **Name** | `my-wa-bot` |
+| **Runtime** | `Python 3` |
+| **Build Command** | `pip install -r requirements.txt` |
+| **Start Command** | `python bot.py` |
+| **Instance Type** | Free (or Starter) |
+
+4. Under **Environment**, add all variables:
+
+| Key | Value |
+|---|---|
+| `BOT_TOKEN` | your Telegram bot token |
+| `BRIDGE_URL` | URL from Step 2 (e.g., `https://my-wa-bridge.onrender.com`) |
+| `BRIDGE_SECRET` | same secret as bridge |
+| `ADMIN_IDS` | your Telegram user ID(s) |
+| `RENDER_URL` | this service's URL (e.g., `https://my-wa-bot.onrender.com`) |
+| `PORT` | `10000` |
+| `BOT_MODE` | `paid` |
+
+5. Click **Create Web Service**
+
+---
+
+### Step 4 — Webhook Auto-Setup
+
+On startup, `bot.py` automatically registers the Telegram webhook by calling:
+
+```
+https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=<RENDER_URL>/webhook
+```
+
+You do **not** need to do anything manually. Check the Render logs to confirm:
+```
+✅ Webhook set to: https://my-wa-bot.onrender.com/webhook
+🚀 Flask server running on port 10000
+```
+
+To verify the webhook is active at any time:
+```
+https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo
+```
+
+---
+
+### Step 5 — Scan WhatsApp QR Code
+
+1. Open the bridge service logs in Render dashboard
+2. You'll see a QR code printed in the terminal
+3. Open WhatsApp on your phone → Linked Devices → Link a Device
+4. Scan the QR code
+5. The session is saved in `wa_sessions/` — subsequent restarts won't require re-scanning
+
+> **Note:** Free Render instances spin down after inactivity. Use a keep-alive ping or upgrade to a paid instance to maintain persistent sessions.
+
+---
+
+## 💻 Local Development
+
+For local testing, the bot falls back to **polling mode** when `RENDER_URL` is not set or the environment is detected as local.
+
+### Setup
+
+```bash
+# Clone and install
+git clone https://github.com/YOUR_USERNAME/whatsapp-bot.git
+cd whatsapp-bot
+pip install -r requirements.txt
+npm install
+
+# Create local .env
+cp .env.example .env
+# Edit .env with your values (leave RENDER_URL empty for polling)
+```
+
+### Run locally (two terminals)
+
+**Terminal 1 — Bridge:**
+```bash
+node bridge.js
+```
+
+**Terminal 2 — Bot (polling mode):**
+```bash
+python bot.py
+```
+
+When `RENDER_URL` is not set, the bot automatically uses long-polling instead of webhooks — no port forwarding needed.
+
+---
+
+## 📋 Command Reference
+
+### User Commands
+
+| Command | Description | Availability |
+|---|---|---|
+| `/start` | Welcome message & bot info | All users |
+| `/help` | Full command list | All users |
+| `/status` | Check WhatsApp connection status | Premium / Free mode |
+| `/listgroups` | List all WhatsApp groups | Premium / Free mode |
+| `/sendmessage` | Send message to a group | Premium / Free mode |
+| `/addmember` | Add member to a group | Premium / Free mode |
+| `/removemember` | Remove member from a group | Premium / Free mode |
+| `/mute` | Mute group (admin only in group) | Premium / Free mode |
+| `/unmute` | Unmute group | Premium / Free mode |
+| `/groupinfo` | Get group details | Premium / Free mode |
+| `/mypremium` | Check your premium status | All users |
+
+### Admin Commands
+
+| Command | Description | Admin Only |
+|---|---|---|
+| `/admin` | Open admin panel | ✅ |
+| `/addpremium <user_id> [days]` | Grant premium access | ✅ |
+| `/removepremium <user_id>` | Revoke premium access | ✅ |
+| `/listpremium` | List all premium users | ✅ |
+| `/setmode <free\|paid>` | Switch bot mode at runtime | ✅ |
+| `/stats` | Bot usage statistics | ✅ |
+| `/broadcast <message>` | Send message to all users | ✅ |
+
+---
+
+## 👑 Premium System
+
+### How FREE / PAID Mode Works
+
+The bot operates in one of two modes, configurable via `BOT_MODE` in your `.env` or switched live with `/setmode`:
+
+| Mode | Behavior |
+|---|---|
+| **`free`** | All Telegram users can use all bot features without restriction |
+| **`paid`** | Only users in `premium_users.db` (plus admins) can access features |
+
+In **paid mode**, non-premium users receive a message explaining they need access, with instructions to contact the admin.
+
+### Adding Premium Users
+
+**Via Telegram (admin command):**
+```
+/addpremium 123456789
+```
+Grants permanent premium access.
+
+```
+/addpremium 123456789 30
+```
+Grants premium access for **30 days** (temp access).
+
+**Via code / database directly:**
+```python
+# premium.py helper
+from premium import add_premium_user
+add_premium_user(user_id=123456789, days=30)   # 30-day access
+add_premium_user(user_id=987654321)             # permanent
+```
+
+### Removing Premium Users
+
+```
+/removepremium 123456789
+```
+
+This immediately revokes access. The user's record is removed from `premium_users.db`.
+
+### Temporary Access
+
+When a user is added with a day limit (e.g., `/addpremium 123456789 7`):
+- Access expires automatically after 7 days
+- The bot checks expiry on each command
+- Expired users are notified and lose access
+- Admins can see expiry dates with `/listpremium`
+
+### Premium Database (`premium_users.db`)
+
+The SQLite database is auto-created on first run. Schema:
+
+```sql
+CREATE TABLE premium_users (
+    user_id     INTEGER PRIMARY KEY,
+    username    TEXT,
+    added_by    INTEGER,
+    added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at  TIMESTAMP NULL    -- NULL = permanent
+);
+```
+
+---
+
+## 🏗️ Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        RENDER CLOUD                         │
+│                                                             │
+│  ┌──────────────────────────┐  ┌─────────────────────────┐ │
+│  │   BOT SERVICE (Python)   │  │  BRIDGE SERVICE (Node)  │ │
+│  │                          │  │                         │ │
+│  │  Flask HTTP Server       │  │  Express HTTP Server    │ │
+│  │  ┌────────────────────┐  │  │  ┌───────────────────┐ │ │
+│  │  │ Telegram Webhook   │  │  │  │  Baileys WA SDK   │ │ │
+│  │  │ /webhook endpoint  │  │  │  │  (Multi-session)  │ │ │
+│  │  └────────────────────┘  │  │  └───────────────────┘ │ │
+│  │  ┌────────────────────┐  │  │  ┌───────────────────┐ │ │
+│  │  │ Premium System     │  │  │  │ wa_sessions/      │ │ │
+│  │  │ premium_users.db   │  │  │  │ (QR auth saved)   │ │ │
+│  │  └────────────────────┘  │  │  └───────────────────┘ │ │
+│  │                          │  │                         │ │
+│  │  URL: my-wa-bot.onrender │  │  URL: my-wa-bridge      │ │
+│  └──────────┬───────────────┘  └──────────┬──────────────┘ │
+│             │  REST API (BRIDGE_SECRET)    │                │
+│             └─────────────────────────────┘                │
+└─────────────────────────────────────────────────────────────┘
+         ▲                                    ▲
+         │ HTTPS Webhook                      │ WhatsApp
+         │                                    │ Web Protocol
+┌────────┴────────┐                  ┌────────┴────────┐
+│  Telegram API   │                  │  WhatsApp Web   │
+│  (Servers)      │                  │  (Meta servers) │
+└─────────────────┘                  └─────────────────┘
+         ▲
+         │ sends/receives messages
+┌────────┴────────┐
+│  Telegram User  │
+│  (Your phone)   │
+└─────────────────┘
+```
+
+**Request flow:**
+1. User sends Telegram message → Telegram API → `POST /webhook` on bot service
+2. Bot checks premium status in `premium_users.db`
+3. If authorized, bot calls bridge service REST API (authenticated with `BRIDGE_SECRET`)
+4. Bridge executes WhatsApp action via Baileys SDK
+5. Response returned to user via Telegram
+
+---
+
+## 🔧 Troubleshooting
+
+### Render-Specific Issues
+
+**❌ Service keeps sleeping / WhatsApp disconnects**
+- **Cause:** Free Render instances spin down after 15 minutes of inactivity
+- **Fix:** Upgrade to a Starter ($7/mo) instance, or set up an external keep-alive cron (e.g., [UptimeRobot](https://uptimerobot.com)) pinging `RENDER_URL/health` every 10 minutes
+
+**❌ Webhook not receiving updates**
+- **Cause:** Wrong `RENDER_URL` or port mismatch
+- **Fix:** Check `getWebhookInfo` endpoint. Ensure `RENDER_URL` matches exactly the Render service URL. Render exposes port `10000` by default — set `PORT=10000` in env vars.
+
+**❌ Bridge connection refused**
+- **Cause:** Bridge service URL is wrong or service hasn't started
+- **Fix:** Check `BRIDGE_URL` in bot service env vars. Open the bridge service URL in browser — you should see `{"status":"ok"}`. Check bridge service logs for errors.
+
+**❌ `BRIDGE_SECRET` authentication error**
+- **Cause:** Secret mismatch between bot and bridge services
+- **Fix:** Ensure both services have the identical `BRIDGE_SECRET` value in their Render environment variables.
+
+**❌ QR code not appearing / WhatsApp won't link**
+- **Cause:** Old or corrupt session data
+- **Fix:** Delete `wa_sessions/` folder contents via Render shell, then redeploy the bridge service.
+
+**❌ `premium_users.db` resets on every deploy**
+- **Cause:** Render free instances have ephemeral disk storage
+- **Fix:** Upgrade to a paid Render instance with a Persistent Disk attached, or migrate the database to an external SQLite host / PostgreSQL.
+
+---
+
+### General Issues
+
+**❌ Bot not responding at all**
+1. Check Render logs for Python errors
+2. Verify `BOT_TOKEN` is correct
+3. Run `getWebhookInfo` to confirm webhook is set
+4. Try `/start` command
+
+**❌ Commands work locally but not on Render**
+- Ensure all `.env` variables are added to Render's environment dashboard
+- Local `.env` files are NOT uploaded to Render
+
+**❌ `ModuleNotFoundError`**
+- Ensure `requirements.txt` includes all dependencies
+- Check build logs in Render dashboard for install errors
+
+**❌ User getting "access denied" in free mode**
+- Check `BOT_MODE` env var — it must be exactly `free` (lowercase)
+- Use `/setmode free` admin command to toggle at runtime without redeployment
+
+---
+
+## 📝 Quick Reference Checklist
+
+Before going live, confirm:
+
+- [ ] `.env` created locally with all variables
+- [ ] `.env` added to `.gitignore`
+- [ ] All env vars set in **both** Render services
+- [ ] `bridge.js` deployed and accessible (check `/health`)
+- [ ] `bot.py` deployed and webhook confirmed (`getWebhookInfo`)
+- [ ] WhatsApp QR scanned and session saved
+- [ ] Admin Telegram ID added to `ADMIN_IDS`
+- [ ] Tested `/start`, `/admin`, and one group command
+- [ ] Keep-alive service configured (if on free tier)
+
+---
+
+*Last updated: April 2026 | Render Deployment + Premium System Edition*
