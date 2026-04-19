@@ -1,0 +1,197 @@
+# Render Deployment Guide
+## WhatsApp Group Manager — Single-Service Setup
+
+---
+
+## render.yaml (Blueprint)
+
+Place this file in the **root** of your repository. Render picks it up automatically when you connect the repo.
+
+```yaml
+services:
+  - type: web
+    name: whatsapp-bot
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt
+      npm install
+    startCommand: python start.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # Set manually in Render dashboard (secret)
+      - key: BRIDGE_SECRET
+        sync: false          # Set manually in Render dashboard (secret)
+      - key: ADMIN_IDS
+        sync: false          # Set manually in Render dashboard (secret)
+      - key: RENDER_URL
+        sync: false          # Set manually — your Render public URL
+      - key: BRIDGE_URL
+        value: http://localhost:3000   # Internal, no change needed
+      - key: BOT_MODE
+        value: paid
+      - key: PORT
+        value: "5000"
+      - key: BRIDGE_PORT
+        value: "3000"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: NODE_VERSION
+        value: "18"
+```
+
+---
+
+## .env (Local Development)
+
+Copy this to a file named `.env` in the project root. **Never commit this file to Git.**
+
+```env
+BOT_TOKEN=your_telegram_bot_token_here
+BRIDGE_URL=http://localhost:3000
+BRIDGE_SECRET=your_bridge_secret_here
+ADMIN_IDS=your_telegram_user_id_here
+RENDER_URL=https://your-app-name.onrender.com
+PORT=5000
+BRIDGE_PORT=3000
+BOT_MODE=paid
+```
+
+---
+
+## requirements.txt
+
+```
+python-telegram-bot==20.7
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+aiofiles>=23.2.1
+flask>=3.0.0
+pytz>=2024.1
+```
+
+---
+
+## Step-by-Step Render Deployment (Single Service)
+
+### 1. Prepare your repository
+Ensure all the files listed in the **File Structure** section below are committed and pushed to GitHub (or GitLab / Bitbucket).
+
+```bash
+git add .
+git commit -m "Add start.py launcher and render.yaml"
+git push origin main
+```
+
+### 2. Create a new Web Service on Render
+- Go to [https://dashboard.render.com](https://dashboard.render.com)
+- Click **New ▸ Web Service**
+- Connect your GitHub repository
+
+### 3. Configure the service
+| Field | Value |
+|---|---|
+| **Name** | `whatsapp-bot` (or any name you like) |
+| **Runtime** | `Python 3` |
+| **Build Command** | `pip install -r requirements.txt && npm install` |
+| **Start Command** | `python start.py` |
+
+> Render installs Node.js automatically when it detects `package.json` in the repo — no extra configuration needed.
+
+### 4. Add environment variables
+In the **Environment** tab, add each variable below. Mark sensitive ones as **Secret**:
+
+| Key | Value | Secret? |
+|---|---|---|
+| `BOT_TOKEN` | Your Telegram bot token | ✅ Yes |
+| `BRIDGE_SECRET` | Your bridge shared secret | ✅ Yes |
+| `ADMIN_IDS` | Your Telegram user ID(s) | ✅ Yes |
+| `RENDER_URL` | `https://your-app.onrender.com` | No |
+| `BRIDGE_URL` | `http://localhost:3000` | No |
+| `BOT_MODE` | `paid` | No |
+| `PORT` | `5000` | No |
+| `BRIDGE_PORT` | `3000` | No |
+
+### 5. Deploy
+Click **Create Web Service**. Render will:
+1. Clone the repo
+2. Run the build command (`pip install` + `npm install`)
+3. Execute `python start.py`, which launches **bridge.js** and **bot.py** together
+
+### 6. Monitor logs
+In the Render dashboard, open the **Logs** tab. You will see interleaved, prefixed output:
+
+```
+[LAUNCHER] BRIDGE_URL = http://localhost:3000
+[BRIDGE]   WhatsApp Bridge Server listening on port 3000
+[LAUNCHER] ✅ Bridge is healthy (attempt 2/15).
+[BOT]      Telegram bot polling started...
+```
+
+---
+
+## File Structure
+
+```
+whatsapp-bot/
+├── start.py            ← Master launcher (run this — starts everything)
+├── bot.py              ← Telegram bot logic
+├── bridge.js           ← WhatsApp bridge server (Node.js)
+├── requirements.txt    ← Python dependencies
+├── package.json        ← Node.js dependencies
+├── render.yaml         ← Render blueprint (auto-detected)
+├── .env                ← Local environment variables (DO NOT commit)
+└── premium_users.db    ← SQLite database (auto-created at runtime)
+```
+
+---
+
+## How start.py Works
+
+```
+python start.py
+       │
+       ├─► [Thread] node bridge.js   ← runs in background, auto-restarts on crash
+       │         │
+       │         └─► streams output with [BRIDGE] prefix
+       │
+       ├─► Health check loop → GET http://localhost:3000/health (up to 15 attempts)
+       │
+       └─► import bot; bot.main()    ← runs in main thread (blocking)
+                 │
+                 └─► streams output with [BOT] prefix
+
+On SIGTERM / SIGINT:
+  → shutdown_event is set
+  → bridge subprocess is terminated gracefully (SIGTERM → wait 10 s → SIGKILL)
+  → main thread exits cleanly
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| `node: not found` | Node.js not installed in build | Make sure `package.json` exists so Render installs Node |
+| `Could not import 'bot'` | `bot.py` missing or wrong directory | Confirm `bot.py` is in the repo root |
+| Bridge never becomes healthy | Wrong `BRIDGE_PORT` or bridge crash | Check `[BRIDGE]` log lines for errors |
+| Bot starts but can't reach bridge | `BRIDGE_URL` misconfigured | Keep `BRIDGE_URL=http://localhost:3000` for single-service |
+| Service restarts every 30 s | Render free tier spin-down | Upgrade to a paid Render plan or add a keep-alive ping |
+
+---
+
+## Local Testing
+
+```bash
+# Install all dependencies
+pip install -r requirements.txt
+npm install
+
+# Copy and fill in your secrets
+cp .env.example .env   # edit values
+
+# Launch everything with a single command
+python start.py
+```
+
+Press **Ctrl+C** to stop both services cleanly.
