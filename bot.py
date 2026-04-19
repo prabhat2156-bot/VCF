@@ -1,32 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║       WhatsApp Group Manager - Telegram Bot                      ║
-║       Python Backend + Node.js Baileys Bridge                    ║
-║       Complete Production-Ready Script (MongoDB Edition)         ║
-╚══════════════════════════════════════════════════════════════════╝
-
-SETUP INSTRUCTIONS:
-=====================================
-
-1. Install Python Dependencies:
-   pip install python-telegram-bot pymongo flask requests python-dotenv
-
-2. Environment Variables (.env):
-   BOT_TOKEN=your_telegram_bot_token
-   ADMIN_IDS=123456789,987654321
-   BRIDGE_URL=http://localhost:3000
-   BRIDGE_SECRET=your_bridge_secret
-   MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/whatsapp_bot
-   RENDER_URL=https://your-app.onrender.com   (optional, for webhook)
-   PORT=8080                                   (optional, default 8080)
-
-3. Node.js Baileys Bridge must be running separately.
-
-4. Run: python bot.py
-"""
-
 import os
 import sys
 import json
