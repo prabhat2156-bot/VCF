@@ -232,7 +232,7 @@ class BridgeAPI:
     def __init__(self, base_url: str, api_key: str):
         self.base  = base_url.rstrip("/")
         self.key   = api_key
-        self.hdrs  = {"x-api-key": api_key, "Content-Type": "application/json"}
+        self.hdrs = {"X-Secret": api_key, "Content-Type": "application/json"}
 
     def _post(self, path: str, payload: dict) -> dict:
         try:
