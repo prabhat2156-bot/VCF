@@ -1,12 +1,3 @@
-"""
-Render entry-point.
-
-- Starts a tiny Flask web server on $PORT  (Render Web Service requires this).
-- Runs the Telegram bot (bot.py) in a background thread.
-- A keep-alive thread pings the public URL every 2 minutes so the
-  free Render instance does not go to sleep.
-"""
-
 import os
 import time
 import logging
