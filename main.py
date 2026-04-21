@@ -1,81 +1,58 @@
-import os
-import time
-import logging
-import threading
+# main.py
+# Render 24/7 Runner for your uploaded bot.py
 
+import os
+import threading
+import time
 import requests
 from flask import Flask
 
-import bot  # imports bot.py (the full Telegram bot)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-log = logging.getLogger("render-entry")
+# Import your uploaded bot.py
+import bot
 
 app = Flask(__name__)
 
-
 @app.route("/")
-def index():
-    return "Bot is alive ✅", 200
-
+def home():
+    return "Telegram Bot Running 24/7"
 
 @app.route("/health")
 def health():
-    return {"status": "ok"}, 200
+    return {"status": "ok"}
 
-
-# ---------------------------------------------------------------------------
-# Bot thread
-# ---------------------------------------------------------------------------
-def _run_bot():
-    try:
-        log.info("Starting Telegram bot…")
-        bot.main()
-    except Exception as e:
-        log.exception("Bot crashed: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# Keep-alive: ping our own public URL every 2 minutes
-# ---------------------------------------------------------------------------
-def _keep_alive():
-    # Render exposes the public URL in this env var.
-    url = (
-        os.environ.get("RENDER_EXTERNAL_URL")
-        or os.environ.get("PING_URL")
-        or ""
-    ).rstrip("/")
-    if not url:
-        log.warning("No RENDER_EXTERNAL_URL / PING_URL set — keep-alive disabled.")
-        return
-
-    ping_url = f"{url}/health"
-    log.info("Keep-alive will ping %s every 2 minutes.", ping_url)
-    # small delay so the web server is up first
-    time.sleep(20)
+# Self ping every 2 min
+def auto_ping():
     while True:
         try:
-            r = requests.get(ping_url, timeout=10)
-            log.info("Keep-alive ping → %s", r.status_code)
+            url = os.getenv("RENDER_EXTERNAL_URL")
+            if url:
+                requests.get(url, timeout=10)
+                print("Ping Success")
         except Exception as e:
-            log.warning("Keep-alive ping failed: %s", e)
-        time.sleep(120)  # 2 minutes
+            print("Ping Error:", e)
 
+        time.sleep(120)
 
-def _start_background_threads():
-    threading.Thread(target=_run_bot, name="telegram-bot", daemon=True).start()
-    threading.Thread(target=_keep_alive, name="keep-alive", daemon=True).start()
-
-
-# Start the background threads as soon as this module is imported
-# (Gunicorn imports it once per worker, plain `python main.py` runs it directly).
-_start_background_threads()
-
+# Start your bot.py
+def run_bot():
+    try:
+        if hasattr(bot, "main"):
+            bot.main()
+        elif hasattr(bot, "run"):
+            bot.run()
+        else:
+            # python-telegram-bot async script detect
+            import asyncio
+            if hasattr(bot, "application"):
+                asyncio.run(bot.application.run_polling())
+            else:
+                exec(open("bot.py").read())
+    except Exception as e:
+        print("Bot Error:", e)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    log.info("Starting Flask on 0.0.0.0:%s", port)
+    threading.Thread(target=run_bot).start()
+    threading.Thread(target=auto_ping).start()
+
+    port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
