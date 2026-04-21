@@ -5,3 +5,4 @@ pytesseract
 Pillow==10.4.0
 vobject
 httpx==0.27.2
+requests
